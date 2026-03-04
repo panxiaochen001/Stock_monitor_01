@@ -61,13 +61,13 @@ def build_wechat_content(anns):
     lines.append(f"\n*检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
     return "\n\n".join(lines)
 
-def parse_stock_input(raw: str) -> list:
+def parse_stock_input(raw: str, token: str = "") -> list:
     """
     解析批量输入，支持：
     - 数字代码：600036.SH / 600036 / 000858
     - 代码+名称：600036.SH 招商银行
     - 逗号分隔：600036,000858,300750
-    - 纯中文名称：生益科技（通过内置词典或巨潮模糊匹配）
+    - 纯中文名称：生益科技、生益电子（通过 Tushare 本地对照表匹配）
     返回 [{"code": "600036.SH", "name": "招商银行"}, ...]
     """
     result = []
@@ -117,9 +117,9 @@ def parse_stock_input(raw: str) -> list:
                     seen.add(code)
                     result.append({"code": code, "name": name})
 
-            # ── 情况3：中文名称，通过巨潮搜索转代码 ──
+            # ── 情况3：中文名称，通过 Tushare 本地对照表查找 ──
             elif _is_chinese(word):
-                matched = search_stock_by_name(word)
+                matched = search_stock_by_name(word, token=token)
                 if matched and matched["code"] not in seen:
                     seen.add(matched["code"])
                     result.append(matched)
@@ -140,30 +140,62 @@ def _is_chinese(s):
     """判断是否包含中文字符"""
     return any("\u4e00" <= c <= "\u9fff" for c in s)
 
-def search_stock_by_name(name: str) -> dict:
-    """通过巨潮资讯用中文名称搜索股票代码"""
+def get_stock_dict(token: str) -> dict:
+    """
+    从 Tushare 获取全量A股名称→代码对照表，缓存在 session_state。
+    调用 stock_basic 接口，无需积分，所有用户均可用。
+    返回 {"招商银行": "600036.SH", "生益科技": "600183.SZ", ...}
+    """
+    if "stock_dict" in st.session_state and st.session_state.stock_dict:
+        return st.session_state.stock_dict
+
+    if not token:
+        return {}
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        resp = requests.post(
-            "http://www.cninfo.com.cn/new/information/topSearch/query",
-            data={"keyWord": name, "maxNum": 5},
-            headers=headers, timeout=8,
-        )
-        items = resp.json().get("keyBoardList", [])
-        if items:
-            item = items[0]
-            raw_code = item.get("code", "")
-            market   = item.get("market", "").upper()
-            # 补后缀
-            if not market:
-                market = "SH" if raw_code.startswith("6") else "SZ"
-            code = f"{raw_code}.{market}"
-            return {"code": code, "name": item.get("zwjc", name)}
-    except Exception:
-        pass
+        import tushare as ts
+        pro = ts.pro_api(token)
+        # 拉取全量股票基础信息（无需积分）
+        df = pro.stock_basic(exchange="", list_status="L",
+                             fields="ts_code,symbol,name,market")
+        if df is None or df.empty:
+            return {}
+        stock_dict = {}
+        for _, row in df.iterrows():
+            name    = str(row.get("name", "")).strip()
+            ts_code = str(row.get("ts_code", "")).strip()
+            if name and ts_code:
+                stock_dict[name] = ts_code
+        st.session_state.stock_dict = stock_dict
+        return stock_dict
+    except Exception as e:
+        st.warning(f"⚠️ 获取股票列表失败：{e}")
+        return {}
+
+
+def search_stock_by_name(name: str, token: str = "") -> dict:
+    """
+    用中文名称在本地对照表中查找股票代码（精确匹配 + 模糊匹配）。
+    依赖 get_stock_dict() 缓存的对照表，完全不需要额外网络请求。
+    """
+    stock_dict = get_stock_dict(token)
+    if not stock_dict:
+        return None
+
+    name = name.strip()
+
+    # 1. 精确匹配
+    if name in stock_dict:
+        ts_code = stock_dict[name]
+        return {"code": ts_code, "name": name}
+
+    # 2. 模糊匹配（包含关系）
+    candidates = [(n, c) for n, c in stock_dict.items() if name in n or n in name]
+    if candidates:
+        # 优先选名称长度最接近的
+        candidates.sort(key=lambda x: abs(len(x[0]) - len(name)))
+        matched_name, matched_code = candidates[0]
+        return {"code": matched_code, "name": matched_name}
+
     return None
 
 # ─────────────────────────────────────────────
@@ -353,9 +385,17 @@ with st.sidebar:
 
     # ── 批量输入股票 ──
     st.markdown("### ➕ 批量输入股票")
+    # 有 token 时预热股票字典缓存
+    if tushare_token and "stock_dict" not in st.session_state:
+        with st.spinner("首次加载股票列表..."):
+            d = get_stock_dict(tushare_token)
+        if d:
+            st.success(f"✅ 已加载 {len(d)} 只股票，支持中文名称搜索")
+
     st.markdown("""<div class="tip-box">
     支持以下所有格式（每行一个，也可逗号分隔）：<br>
     <code>生益科技</code> ← 直接输中文名 ✅<br>
+    <code>生益电子</code> ← 模糊匹配 ✅<br>
     <code>600036.SH 招商银行</code><br>
     <code>000858 五粮液</code><br>
     <code>600036,000858,300750</code><br>
@@ -369,7 +409,7 @@ with st.sidebar:
     if st.button("✅ 确认添加", use_container_width=True):
         if batch_input.strip():
             st.session_state["_unresolved"] = []
-            parsed = parse_stock_input(batch_input)
+            parsed = parse_stock_input(batch_input, token=tushare_token)
             added, skipped = 0, 0
             for s in parsed:
                 if not any(x["code"] == s["code"] for x in st.session_state.watch_stocks):
