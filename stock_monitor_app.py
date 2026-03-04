@@ -379,7 +379,10 @@ with st.sidebar:
     if sendkey:
         if st.button("🧪 测试微信推送", use_container_width=True):
             ok = send_wechat(sendkey, "✅ 股票监控测试", "推送成功！有新公告时会自动通知你 📋")
-            st.success("✅ 推送成功！检查微信") if ok else st.error("❌ 失败，检查 SendKey")
+            if ok:
+                st.success("✅ 推送成功！检查微信")
+            else:
+                st.error("❌ 失败，检查 SendKey 是否正确")
 
     st.markdown("---")
 
