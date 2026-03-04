@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import hashlib
 import time
+import json
 from datetime import datetime, timedelta
 
 # ─────────────────────────────────────────────
@@ -29,6 +30,65 @@ div[data-testid="stMetricValue"]{color:#00d4ff;}
 .tip-box{background:#1a2744;border:1px solid #00d4ff33;border-radius:8px;padding:12px 16px;font-size:13px;color:#a0b4c8;margin-bottom:12px;}
 </style>
 """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+# GitHub 持久化存储
+# ─────────────────────────────────────────────
+GITHUB_REPO = "panxiaochen001/Stock_monitor_01"
+STOCKS_FILE = "stocks.json"   # 保存在仓库根目录
+
+def _github_headers(token):
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+def load_stocks_from_github(token: str) -> list:
+    """从 GitHub 读取 stocks.json，返回股票列表"""
+    if not token:
+        return []
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STOCKS_FILE}"
+        r = requests.get(url, headers=_github_headers(token), timeout=10)
+        if r.status_code == 404:
+            return []   # 文件还不存在，首次使用
+        if r.status_code == 200:
+            import base64
+            data = r.json()
+            decoded = base64.b64decode(data["content"]).decode("utf-8")
+            return json.loads(decoded)
+    except Exception as e:
+        st.warning(f"⚠️ 读取股票列表失败：{e}")
+    return []
+
+def save_stocks_to_github(token: str, stocks: list) -> bool:
+    """把股票列表写回 GitHub stocks.json"""
+    if not token:
+        return False
+    try:
+        import base64, json as _json
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STOCKS_FILE}"
+        # 先拿 sha（更新文件必须提供）
+        r = requests.get(url, headers=_github_headers(token), timeout=10)
+        sha = r.json().get("sha", "") if r.status_code == 200 else ""
+
+        content_b64 = base64.b64encode(
+            _json.dumps(stocks, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("utf-8")
+
+        payload = {
+            "message": f"update stocks {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "content": content_b64,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        resp = requests.put(url, headers=_github_headers(token),
+                            json=payload, timeout=15)
+        return resp.status_code in (200, 201)
+    except Exception as e:
+        st.warning(f"⚠️ 保存股票列表失败：{e}")
+        return False
 
 # ─────────────────────────────────────────────
 # 工具函数
@@ -294,18 +354,31 @@ def fetch_cninfo(stock_codes, days=1):
 # Session State 初始化
 # ─────────────────────────────────────────────
 for k, v in {
-    "watch_stocks":    [],
-    "announcements":   [],
-    "new_ids":         set(),
-    "last_check":      None,
-    "total_new":       0,
-    "check_days":      1,
-    "ann_type_filter": "全部",
-    "push_log":        [],
-    "data_source":     "tushare",
+    "watch_stocks":      [],
+    "announcements":     [],
+    "new_ids":           set(),
+    "last_check":        None,
+    "total_new":         0,
+    "check_days":        1,
+    "ann_type_filter":   "全部",
+    "push_log":          [],
+    "data_source":       "tushare",
+    "stocks_loaded":     False,   # 标记是否已从 GitHub 加载过
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# 首次加载：从 GitHub 读取持久化的股票列表
+if not st.session_state.stocks_loaded:
+    try:
+        _gh_token = st.secrets.get("GITHUB_TOKEN", "")
+    except Exception:
+        _gh_token = ""
+    if _gh_token:
+        _saved = load_stocks_from_github(_gh_token)
+        if _saved:
+            st.session_state.watch_stocks = _saved
+    st.session_state.stocks_loaded = True
 
 # ─────────────────────────────────────────────
 # 检查公告
@@ -357,9 +430,11 @@ with st.sidebar:
 
     default_ts_token = ""
     default_sendkey  = ""
+    default_sendkey2 = ""
     try:
         default_ts_token = st.secrets.get("TUSHARE_TOKEN", "")
         default_sendkey  = st.secrets.get("SENDKEY", "")
+        default_sendkey2 = st.secrets.get("SENDKEY2", "")
     except Exception:
         pass
 
@@ -373,16 +448,22 @@ with st.sidebar:
 
     # ── 微信推送 ──
     st.markdown("### 📱 微信推送")
-    sendkey = st.text_input("Server酱 SendKey", type="password",
-        value=default_sendkey, placeholder="SCT开头，留空不推送")
-    st.markdown('<small style="color:#7d8590">👉 <a href="https://sct.ftqq.com" target="_blank" style="color:#00d4ff">获取免费 SendKey</a></small>', unsafe_allow_html=True)
-    if sendkey:
-        if st.button("🧪 测试微信推送", use_container_width=True):
-            ok = send_wechat(sendkey, "✅ 股票监控测试", "推送成功！有新公告时会自动通知你 📋")
-            if ok:
-                st.success("✅ 推送成功！检查微信")
+    st.markdown('<small style="color:#7d8590">👉 <a href="https://sct.ftqq.com" target="_blank" style="color:#00d4ff">获取免费 SendKey</a> · 最多同时推送2个微信</small>', unsafe_allow_html=True)
+    sendkey  = st.text_input("微信1 SendKey", type="password",
+        value=default_sendkey,  placeholder="SCT开头，必填")
+    sendkey2 = st.text_input("微信2 SendKey（可选）", type="password",
+        value=default_sendkey2, placeholder="第二个微信的Key，留空跳过")
+    all_sendkeys = ",".join(k for k in [sendkey, sendkey2] if k.strip())
+    if all_sendkeys:
+        if st.button("🧪 测试推送", use_container_width=True):
+            ok_count, fail_count = send_wechat(all_sendkeys, "✅ 股票监控测试", "推送成功！有新公告时会自动通知你 📋")
+            total = ok_count + fail_count
+            if ok_count == total:
+                st.success(f"✅ {ok_count} 个微信推送成功！")
+            elif ok_count > 0:
+                st.warning(f"⚠️ {ok_count} 个成功，{fail_count} 个失败，检查失败的 SendKey")
             else:
-                st.error("❌ 失败，检查 SendKey 是否正确")
+                st.error("❌ 全部失败，检查 SendKey 是否正确")
 
     st.markdown("---")
 
@@ -422,6 +503,13 @@ with st.sidebar:
                     skipped += 1
             unresolved = st.session_state.get("_unresolved", [])
             if added:
+                # 保存到 GitHub
+                try:
+                    _gh_token = st.secrets.get("GITHUB_TOKEN", "")
+                except Exception:
+                    _gh_token = ""
+                if _gh_token:
+                    save_stocks_to_github(_gh_token, st.session_state.watch_stocks)
                 msg = f"✅ 成功添加 {added} 只股票！"
                 if skipped: msg += f"（{skipped} 只已在列表中跳过）"
                 st.success(msg)
@@ -435,6 +523,12 @@ with st.sidebar:
 
     if st.button("🗑 清空全部股票", use_container_width=True):
         st.session_state.watch_stocks = []
+        try:
+            _gh_token = st.secrets.get("GITHUB_TOKEN", "")
+        except Exception:
+            _gh_token = ""
+        if _gh_token:
+            save_stocks_to_github(_gh_token, [])
         st.rerun()
 
     # ── 当前监控列表 ──
@@ -447,7 +541,14 @@ with st.sidebar:
                 st.markdown(f'<span class="stock-tag"><span class="dot-green"></span>{s["name"]} <span style="color:#7d8590;font-size:11px">{s["code"]}</span></span>', unsafe_allow_html=True)
             with c2:
                 if st.button("×", key=f"del_{i}"):
-                    st.session_state.watch_stocks.pop(i); st.rerun()
+                    st.session_state.watch_stocks.pop(i)
+                    try:
+                        _gh_token = st.secrets.get("GITHUB_TOKEN", "")
+                    except Exception:
+                        _gh_token = ""
+                    if _gh_token:
+                        save_stocks_to_github(_gh_token, st.session_state.watch_stocks)
+                    st.rerun()
 
     st.markdown("---")
     st.session_state.check_days = st.selectbox("查询最近几天", [1, 3, 7, 14, 30])
@@ -474,9 +575,9 @@ b1, b2, b3, _ = st.columns([2, 2, 2, 4])
 with b1:
     if st.button("🔍 立即检查公告", use_container_width=True):
         with st.spinner("正在获取公告..."):
-            n = do_check(sendkey, tushare_token)
+            n = do_check(all_sendkeys, tushare_token)
         if n > 0:
-            st.success(f"🎉 发现 {n} 条新公告！{'已推送微信 📱' if sendkey else ''}")
+            st.success(f"🎉 发现 {n} 条新公告！{'已推送微信 📱' if all_sendkeys else ''}")
         else:
             st.info("✅ 暂无新公告")
         st.rerun()
@@ -496,7 +597,7 @@ if auto_refresh:
     elapsed = (datetime.now() - last).seconds if last else 9999
     if elapsed >= 60:
         with st.spinner("🔄 自动检查中..."):
-            do_check(sendkey, tushare_token)
+            do_check(all_sendkeys, tushare_token)
         st.rerun()
     else:
         remaining = 60 - elapsed
