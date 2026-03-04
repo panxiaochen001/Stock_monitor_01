@@ -63,53 +63,118 @@ def build_wechat_content(anns):
 
 def parse_stock_input(raw: str) -> list:
     """
-    解析批量输入，支持多种格式：
-    - 每行一个：600036.SH 招商银行
-    - 逗号/空格分隔：600036,000858,300750
-    - 纯代码（自动判断沪深）
+    解析批量输入，支持：
+    - 数字代码：600036.SH / 600036 / 000858
+    - 代码+名称：600036.SH 招商银行
+    - 逗号分隔：600036,000858,300750
+    - 纯中文名称：生益科技（通过内置词典或巨潮模糊匹配）
     返回 [{"code": "600036.SH", "name": "招商银行"}, ...]
     """
     result = []
     seen   = set()
-    lines  = raw.replace("，", ",").replace("；", "\n").replace(";", "\n").splitlines()
-    for line in lines:
+
+    # 扁平化：把所有内容按行+逗号拆开，每个 token 单独处理
+    raw_clean = raw.replace("，", ",").replace("；", "\n").replace(";", "\n").replace("、", "\n")
+    tokens = []
+    for line in raw_clean.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # 支持逗号分隔写在同一行
-        parts = [p.strip() for p in line.replace(",", " ").split() if p.strip()]
-        i = 0
-        while i < len(parts):
-            token = parts[i]
-            # 是否已含交易所后缀
-            if "." in token and token.split(".")[-1].upper() in ("SH","SZ"):
-                code = token.upper()
-                name = parts[i+1] if i+1 < len(parts) and not _is_code(parts[i+1]) else code
-                if _is_code(name): name = code
-                i += 2 if name != code else 1
-            elif token.isdigit() and len(token) == 6:
-                # 自动补后缀：6开头→SH，0/3开头→SZ
-                suffix = "SH" if token.startswith("6") else "SZ"
-                code   = f"{token}.{suffix}"
-                name   = parts[i+1] if i+1 < len(parts) and not _is_code(parts[i+1]) else code
-                if _is_code(name): name = code
-                i += 2 if name != code else 1
-            else:
-                i += 1
+        for part in line.split(","):
+            part = part.strip()
+            if part:
+                tokens.append(part)
+
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        words = token.split()  # 处理 "600036 招商银行" 这种空格分隔
+
+        for w_idx, word in enumerate(words):
+            word = word.strip()
+            if not word:
                 continue
-            if code not in seen:
-                seen.add(code)
-                result.append({"code": code, "name": name})
+
+            # ── 情况1：带后缀代码，如 600036.SH ──
+            if "." in word and word.split(".")[-1].upper() in ("SH", "SZ"):
+                code = word.upper()
+                # 看下一个词是否是名称
+                name = word
+                if w_idx + 1 < len(words) and not _is_code(words[w_idx + 1]):
+                    name = words[w_idx + 1]
+                if code not in seen:
+                    seen.add(code)
+                    result.append({"code": code, "name": name})
+
+            # ── 情况2：纯数字6位代码，如 600036 ──
+            elif word.isdigit() and len(word) == 6:
+                suffix = "SH" if word.startswith("6") else "SZ"
+                code   = f"{word}.{suffix}"
+                name   = word
+                if w_idx + 1 < len(words) and not _is_code(words[w_idx + 1]):
+                    name = words[w_idx + 1]
+                if code not in seen:
+                    seen.add(code)
+                    result.append({"code": code, "name": name})
+
+            # ── 情况3：中文名称，通过巨潮搜索转代码 ──
+            elif _is_chinese(word):
+                matched = search_stock_by_name(word)
+                if matched and matched["code"] not in seen:
+                    seen.add(matched["code"])
+                    result.append(matched)
+                elif not matched:
+                    # 放入待处理列表，给用户提示
+                    if "_unresolved" not in st.session_state:
+                        st.session_state["_unresolved"] = []
+                    st.session_state["_unresolved"].append(word)
+        i += 1
+
     return result
 
 def _is_code(s):
-    return (s.isdigit() and len(s) == 6) or ("." in s and s.split(".")[-1].upper() in ("SH","SZ"))
+    s = s.strip()
+    return (s.isdigit() and len(s) == 6) or ("." in s and s.split(".")[-1].upper() in ("SH", "SZ"))
+
+def _is_chinese(s):
+    """判断是否包含中文字符"""
+    return any("\u4e00" <= c <= "\u9fff" for c in s)
+
+def search_stock_by_name(name: str) -> dict:
+    """通过巨潮资讯用中文名称搜索股票代码"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        resp = requests.post(
+            "http://www.cninfo.com.cn/new/information/topSearch/query",
+            data={"keyWord": name, "maxNum": 5},
+            headers=headers, timeout=8,
+        )
+        items = resp.json().get("keyBoardList", [])
+        if items:
+            item = items[0]
+            raw_code = item.get("code", "")
+            market   = item.get("market", "").upper()
+            # 补后缀
+            if not market:
+                market = "SH" if raw_code.startswith("6") else "SZ"
+            code = f"{raw_code}.{market}"
+            return {"code": code, "name": item.get("zwjc", name)}
+    except Exception:
+        pass
+    return None
 
 # ─────────────────────────────────────────────
 # 数据抓取
 # ─────────────────────────────────────────────
 def fetch_tushare(stock_codes, token, days=1):
-    """Tushare 公告接口"""
+    """
+    Tushare 公告接口
+    接口名：anns_d（按日期查询）
+    字段：ann_date, ts_code, name, title, url, rec_time
+    """
     try:
         import tushare as ts
     except ImportError:
@@ -123,26 +188,33 @@ def fetch_tushare(stock_codes, token, days=1):
     except Exception as e:
         st.error(f"Tushare 初始化失败：{e}")
         return []
+
     announcements = []
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
     end_date   = datetime.now().strftime("%Y%m%d")
+
     for code in stock_codes:
         try:
-            df = pro.query("anns", ts_code=code, start_date=start_date, end_date=end_date)
+            # 正确接口：anns_d，按 ts_code + 日期范围查询
+            df = pro.anns_d(ts_code=code, start_date=start_date, end_date=end_date)
             if df is None or df.empty:
                 continue
             for _, row in df.iterrows():
-                uid = hashlib.md5(f"{code}{row.get('ann_date','')}{row.get('title','')}".encode()).hexdigest()
+                # 用 ts_code + ann_date + title 生成唯一ID
+                uid = hashlib.md5(
+                    f"{row.get('ts_code','')}{row.get('ann_date','')}{row.get('title','')}".encode()
+                ).hexdigest()
                 announcements.append({
                     "id":    uid,
-                    "code":  code,
+                    "code":  row.get("ts_code", code),
                     "name":  row.get("name", code),
                     "title": row.get("title", ""),
-                    "time":  row.get("ann_date", ""),
+                    "time":  row.get("rec_time") or row.get("ann_date", ""),  # 优先用发布时间
                     "url":   row.get("url", ""),
                 })
         except Exception as e:
             st.warning(f"⚠️ {code} 获取失败：{e}")
+
     return announcements
 
 def fetch_cninfo(stock_codes, days=1):
@@ -282,7 +354,8 @@ with st.sidebar:
     # ── 批量输入股票 ──
     st.markdown("### ➕ 批量输入股票")
     st.markdown("""<div class="tip-box">
-    支持格式（每行一个，也可逗号分隔）：<br>
+    支持以下所有格式（每行一个，也可逗号分隔）：<br>
+    <code>生益科技</code> ← 直接输中文名 ✅<br>
     <code>600036.SH 招商银行</code><br>
     <code>000858 五粮液</code><br>
     <code>600036,000858,300750</code><br>
@@ -295,17 +368,27 @@ with st.sidebar:
 
     if st.button("✅ 确认添加", use_container_width=True):
         if batch_input.strip():
+            st.session_state["_unresolved"] = []
             parsed = parse_stock_input(batch_input)
-            added  = 0
+            added, skipped = 0, 0
             for s in parsed:
                 if not any(x["code"] == s["code"] for x in st.session_state.watch_stocks):
                     st.session_state.watch_stocks.append(s)
                     added += 1
+                else:
+                    skipped += 1
+            unresolved = st.session_state.get("_unresolved", [])
             if added:
-                st.success(f"成功添加 {added} 只股票！")
+                msg = f"✅ 成功添加 {added} 只股票！"
+                if skipped: msg += f"（{skipped} 只已在列表中跳过）"
+                st.success(msg)
                 st.rerun()
-            else:
-                st.info("股票已在列表中，无需重复添加")
+            elif skipped and not unresolved:
+                st.info(f"ℹ️ {skipped} 只股票已在监控列表中，无需重复添加")
+            if unresolved:
+                st.warning(f"⚠️ 以下名称未能识别，请改用股票代码：**{'、'.join(unresolved)}**")
+        else:
+            st.warning("请先输入股票代码或名称")
 
     if st.button("🗑 清空全部股票", use_container_width=True):
         st.session_state.watch_stocks = []
