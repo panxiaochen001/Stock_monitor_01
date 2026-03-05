@@ -21,13 +21,12 @@ jobs:
           cache: 'pip'
 
       - name: 安装依赖
-        run: pip install tushare requests
+        run: pip install requests   # 只需要 requests，不再需要 tushare
 
       - name: 执行公告检查
         env:
-          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
-          SENDKEY:       ${{ secrets.SENDKEY }}
-          SENDKEY2:      ${{ secrets.SENDKEY2 }}
-          GITHUB_TOKEN:  ${{ secrets.GH_TOKEN }}
-          GITHUB_REPO:   panxiaochen001/Stock_monitor_01
+          SENDKEY:      ${{ secrets.SENDKEY }}
+          SENDKEY2:     ${{ secrets.SENDKEY2 }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_REPO:  panxiaochen001/Stock_monitor_01
         run: python checker.py
