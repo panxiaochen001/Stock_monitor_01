@@ -4,6 +4,7 @@ import hashlib
 import time
 import json
 from datetime import datetime, timedelta
+from time import sleep
 
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="股票公告监控", page_icon="📋", layout="wide", initial_sidebar_state="expanded")
@@ -32,59 +33,125 @@ div[data-testid="stMetricValue"]{color:#00d4ff;}
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# GitHub 持久化存储
+# 巨潮资讯接口
+# ─────────────────────────────────────────────
+CNINFO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "http://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Origin": "http://www.cninfo.com.cn",
+}
+
+def get_org_id(code: str) -> tuple:
+    pure_code = code.split(".")[0]
+    try:
+        r = requests.post(
+            "http://www.cninfo.com.cn/new/information/topSearch/query",
+            data={"keyWord": pure_code, "maxNum": 5},
+            headers=CNINFO_HEADERS, timeout=10,
+        )
+        for item in r.json().get("keyBoardList", []):
+            if item.get("code") == pure_code:
+                return item.get("orgId", ""), item.get("zwjc", pure_code)
+    except Exception as e:
+        st.warning(f"⚠️ {code} 获取orgId失败：{e}")
+    return "", pure_code
+
+def fetch_cninfo(stock: dict, days: int = 1) -> list:
+    code      = stock["code"]
+    pure_code = code.split(".")[0]
+    market    = code.split(".")[1].lower() if "." in code else "sh"
+    column    = "szse" if market == "sz" else "sse"
+
+    org_id, name = get_org_id(code)
+    if not org_id:
+        return []
+
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    end_date   = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        r = requests.post(
+            "http://www.cninfo.com.cn/new/hisAnnouncement/query",
+            data={
+                "stock":     f"{pure_code},{org_id}",
+                "tabName":   "fulltext",
+                "pageSize":  30,
+                "pageNum":   1,
+                "column":    column,
+                "category":  "",
+                "plate":     market,
+                "seDate":    f"{start_date}~{end_date}",
+                "searchkey": "",
+                "isHLtitle": True,
+            },
+            headers=CNINFO_HEADERS, timeout=15,
+        )
+        result = []
+        for ann in r.json().get("announcements", []):
+            aid   = str(ann.get("announcementId", ""))
+            title = ann.get("announcementTitle", "").strip()
+            ts    = ann.get("announcementTime", 0)
+            try:
+                t = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                t = str(ts)
+            url = (f"http://www.cninfo.com.cn/new/announcement/detail?"
+                   f"announcementId={aid}&orgId={org_id}")
+            uid = hashlib.md5(f"{code}{aid}{title}".encode()).hexdigest()
+            result.append({
+                "id": uid, "code": code, "name": name,
+                "title": title, "time": t, "url": url,
+            })
+        return result
+    except Exception as e:
+        st.warning(f"⚠️ {code} 查询公告失败：{e}")
+        return []
+
+def fetch_all(stocks: list, days: int = 1) -> list:
+    all_anns = []
+    for stock in stocks:
+        all_anns.extend(fetch_cninfo(stock, days))
+        sleep(0.5)
+    return all_anns
+
+# ─────────────────────────────────────────────
+# GitHub 持久化
 # ─────────────────────────────────────────────
 GITHUB_REPO = "panxiaochen001/Stock_monitor_01"
-STOCKS_FILE = "stocks.json"   # 保存在仓库根目录
+STOCKS_FILE = "stocks.json"
 
-def _github_headers(token):
-    return {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
+def _gh_headers(token):
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
 
 def load_stocks_from_github(token: str) -> list:
-    """从 GitHub 读取 stocks.json，返回股票列表"""
-    if not token:
-        return []
+    if not token: return []
     try:
+        import base64
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STOCKS_FILE}"
-        r = requests.get(url, headers=_github_headers(token), timeout=10)
-        if r.status_code == 404:
-            return []   # 文件还不存在，首次使用
+        r = requests.get(url, headers=_gh_headers(token), timeout=10)
         if r.status_code == 200:
-            import base64
-            data = r.json()
-            decoded = base64.b64decode(data["content"]).decode("utf-8")
-            return json.loads(decoded)
+            return json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
     except Exception as e:
         st.warning(f"⚠️ 读取股票列表失败：{e}")
     return []
 
 def save_stocks_to_github(token: str, stocks: list) -> bool:
-    """把股票列表写回 GitHub stocks.json"""
-    if not token:
-        return False
+    if not token: return False
     try:
-        import base64, json as _json
+        import base64
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STOCKS_FILE}"
-        # 先拿 sha（更新文件必须提供）
-        r = requests.get(url, headers=_github_headers(token), timeout=10)
+        r   = requests.get(url, headers=_gh_headers(token), timeout=10)
         sha = r.json().get("sha", "") if r.status_code == 200 else ""
-
         content_b64 = base64.b64encode(
-            _json.dumps(stocks, ensure_ascii=False, indent=2).encode("utf-8")
+            json.dumps(stocks, ensure_ascii=False, indent=2).encode("utf-8")
         ).decode("utf-8")
-
-        payload = {
-            "message": f"update stocks {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "content": content_b64,
-        }
-        if sha:
-            payload["sha"] = sha
-
-        resp = requests.put(url, headers=_github_headers(token),
-                            json=payload, timeout=15)
+        payload = {"message": f"update stocks {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                   "content": content_b64}
+        if sha: payload["sha"] = sha
+        resp = requests.put(url, headers=_gh_headers(token), json=payload, timeout=15)
         return resp.status_code in (200, 201)
     except Exception as e:
         st.warning(f"⚠️ 保存股票列表失败：{e}")
@@ -101,15 +168,22 @@ def load_cache():
 def save_cache(cache):
     st.session_state.seen_cache = cache
 
-def send_wechat(sendkey, title, content):
-    if not sendkey: return False
-    try:
-        r = requests.post(f"https://sctapi.ftqq.com/{sendkey}.send",
-                          data={"title": title, "desp": content}, timeout=10)
-        res = r.json()
-        return res.get("data", {}).get("errno", -1) == 0 or res.get("code") == 0
-    except Exception:
-        return False
+def send_wechat(sendkeys, title, content):
+    if not sendkeys: return 0, 0
+    keys = [k.strip() for k in sendkeys.replace("\n", ",").split(",") if k.strip()]
+    ok_count, fail_count = 0, 0
+    for key in keys:
+        try:
+            r   = requests.post(f"https://sctapi.ftqq.com/{key}.send",
+                                data={"title": title, "desp": content}, timeout=10)
+            res = r.json()
+            if res.get("data", {}).get("errno", -1) == 0 or res.get("code") == 0:
+                ok_count += 1
+            else:
+                fail_count += 1
+        except Exception:
+            fail_count += 1
+    return ok_count, fail_count
 
 def build_wechat_content(anns):
     lines = ["# 📋 持仓股票新公告提醒\n"]
@@ -121,254 +195,86 @@ def build_wechat_content(anns):
     lines.append(f"\n*检查时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
     return "\n\n".join(lines)
 
-def parse_stock_input(raw: str, token: str = "") -> list:
-    """
-    解析批量输入，支持：
-    - 数字代码：600036.SH / 600036 / 000858
-    - 代码+名称：600036.SH 招商银行
-    - 逗号分隔：600036,000858,300750
-    - 纯中文名称：生益科技、生益电子（通过 Tushare 本地对照表匹配）
-    返回 [{"code": "600036.SH", "name": "招商银行"}, ...]
-    """
-    result = []
-    seen   = set()
+def _is_code(s):
+    s = s.strip()
+    return (s.isdigit() and len(s) == 6) or ("." in s and s.split(".")[-1].upper() in ("SH","SZ"))
 
-    # 扁平化：把所有内容按行+逗号拆开，每个 token 单独处理
+def _is_chinese(s):
+    return any("\u4e00" <= c <= "\u9fff" for c in s)
+
+def search_stock_by_name(name: str) -> dict:
+    """通过巨潮搜索中文名称转代码"""
+    try:
+        r = requests.post(
+            "http://www.cninfo.com.cn/new/information/topSearch/query",
+            data={"keyWord": name, "maxNum": 5},
+            headers=CNINFO_HEADERS, timeout=8,
+        )
+        items = r.json().get("keyBoardList", [])
+        if items:
+            item     = items[0]
+            raw_code = item.get("code", "")
+            market   = item.get("market", "").upper() or ("SH" if raw_code.startswith("6") else "SZ")
+            return {"code": f"{raw_code}.{market}", "name": item.get("zwjc", name)}
+    except Exception:
+        pass
+    return None
+
+def parse_stock_input(raw: str) -> list:
+    result, seen = [], set()
     raw_clean = raw.replace("，", ",").replace("；", "\n").replace(";", "\n").replace("、", "\n")
     tokens = []
     for line in raw_clean.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
-            continue
+        if not line or line.startswith("#"): continue
         for part in line.split(","):
             part = part.strip()
-            if part:
-                tokens.append(part)
+            if part: tokens.append(part)
 
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        words = token.split()  # 处理 "600036 招商银行" 这种空格分隔
-
+    for token in tokens:
+        words = token.split()
         for w_idx, word in enumerate(words):
             word = word.strip()
-            if not word:
-                continue
-
-            # ── 情况1：带后缀代码，如 600036.SH ──
-            if "." in word and word.split(".")[-1].upper() in ("SH", "SZ"):
+            if not word: continue
+            if "." in word and word.split(".")[-1].upper() in ("SH","SZ"):
                 code = word.upper()
-                # 看下一个词是否是名称
-                name = word
-                if w_idx + 1 < len(words) and not _is_code(words[w_idx + 1]):
-                    name = words[w_idx + 1]
+                name = words[w_idx+1] if w_idx+1 < len(words) and not _is_code(words[w_idx+1]) else code
                 if code not in seen:
-                    seen.add(code)
-                    result.append({"code": code, "name": name})
-
-            # ── 情况2：纯数字6位代码，如 600036 ──
+                    seen.add(code); result.append({"code": code, "name": name})
             elif word.isdigit() and len(word) == 6:
                 suffix = "SH" if word.startswith("6") else "SZ"
                 code   = f"{word}.{suffix}"
-                name   = word
-                if w_idx + 1 < len(words) and not _is_code(words[w_idx + 1]):
-                    name = words[w_idx + 1]
+                name   = words[w_idx+1] if w_idx+1 < len(words) and not _is_code(words[w_idx+1]) else code
                 if code not in seen:
-                    seen.add(code)
-                    result.append({"code": code, "name": name})
-
-            # ── 情况3：中文名称，通过 Tushare 本地对照表查找 ──
+                    seen.add(code); result.append({"code": code, "name": name})
             elif _is_chinese(word):
-                matched = search_stock_by_name(word, token=token)
+                matched = search_stock_by_name(word)
                 if matched and matched["code"] not in seen:
-                    seen.add(matched["code"])
-                    result.append(matched)
+                    seen.add(matched["code"]); result.append(matched)
                 elif not matched:
-                    # 放入待处理列表，给用户提示
                     if "_unresolved" not in st.session_state:
                         st.session_state["_unresolved"] = []
                     st.session_state["_unresolved"].append(word)
-        i += 1
-
     return result
-
-def _is_code(s):
-    s = s.strip()
-    return (s.isdigit() and len(s) == 6) or ("." in s and s.split(".")[-1].upper() in ("SH", "SZ"))
-
-def _is_chinese(s):
-    """判断是否包含中文字符"""
-    return any("\u4e00" <= c <= "\u9fff" for c in s)
-
-def get_stock_dict(token: str) -> dict:
-    """
-    从 Tushare 获取全量A股名称→代码对照表，缓存在 session_state。
-    调用 stock_basic 接口，无需积分，所有用户均可用。
-    返回 {"招商银行": "600036.SH", "生益科技": "600183.SZ", ...}
-    """
-    if "stock_dict" in st.session_state and st.session_state.stock_dict:
-        return st.session_state.stock_dict
-
-    if not token:
-        return {}
-    try:
-        import tushare as ts
-        pro = ts.pro_api(token)
-        # 拉取全量股票基础信息（无需积分）
-        df = pro.stock_basic(exchange="", list_status="L",
-                             fields="ts_code,symbol,name,market")
-        if df is None or df.empty:
-            return {}
-        stock_dict = {}
-        for _, row in df.iterrows():
-            name    = str(row.get("name", "")).strip()
-            ts_code = str(row.get("ts_code", "")).strip()
-            if name and ts_code:
-                stock_dict[name] = ts_code
-        st.session_state.stock_dict = stock_dict
-        return stock_dict
-    except Exception as e:
-        st.warning(f"⚠️ 获取股票列表失败：{e}")
-        return {}
-
-
-def search_stock_by_name(name: str, token: str = "") -> dict:
-    """
-    用中文名称在本地对照表中查找股票代码（精确匹配 + 模糊匹配）。
-    依赖 get_stock_dict() 缓存的对照表，完全不需要额外网络请求。
-    """
-    stock_dict = get_stock_dict(token)
-    if not stock_dict:
-        return None
-
-    name = name.strip()
-
-    # 1. 精确匹配
-    if name in stock_dict:
-        ts_code = stock_dict[name]
-        return {"code": ts_code, "name": name}
-
-    # 2. 模糊匹配（包含关系）
-    candidates = [(n, c) for n, c in stock_dict.items() if name in n or n in name]
-    if candidates:
-        # 优先选名称长度最接近的
-        candidates.sort(key=lambda x: abs(len(x[0]) - len(name)))
-        matched_name, matched_code = candidates[0]
-        return {"code": matched_code, "name": matched_name}
-
-    return None
-
-# ─────────────────────────────────────────────
-# 数据抓取
-# ─────────────────────────────────────────────
-def fetch_tushare(stock_codes, token, days=1):
-    """
-    Tushare 公告接口
-    接口名：anns_d（按日期查询）
-    字段：ann_date, ts_code, name, title, url, rec_time
-    """
-    try:
-        import tushare as ts
-    except ImportError:
-        st.error("请先安装 tushare：在 requirements.txt 中加入 tushare 并重新部署")
-        return []
-    if not token:
-        st.error("请填写 Tushare Token")
-        return []
-    try:
-        pro = ts.pro_api(token)
-    except Exception as e:
-        st.error(f"Tushare 初始化失败：{e}")
-        return []
-
-    announcements = []
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    end_date   = datetime.now().strftime("%Y%m%d")
-
-    for code in stock_codes:
-        try:
-            # 正确接口：anns_d，按 ts_code + 日期范围查询
-            df = pro.anns_d(ts_code=code, start_date=start_date, end_date=end_date)
-            if df is None or df.empty:
-                continue
-            for _, row in df.iterrows():
-                # 用 ts_code + ann_date + title 生成唯一ID
-                uid = hashlib.md5(
-                    f"{row.get('ts_code','')}{row.get('ann_date','')}{row.get('title','')}".encode()
-                ).hexdigest()
-                announcements.append({
-                    "id":    uid,
-                    "code":  row.get("ts_code", code),
-                    "name":  row.get("name", code),
-                    "title": row.get("title", ""),
-                    "time":  row.get("rec_time") or row.get("ann_date", ""),  # 优先用发布时间
-                    "url":   row.get("url", ""),
-                })
-        except Exception as e:
-            st.warning(f"⚠️ {code} 获取失败：{e}")
-
-    return announcements
-
-def fetch_cninfo(stock_codes, days=1):
-    """巨潮资讯（备用）"""
-    announcements = []
-    end_date   = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "http://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    for code in stock_codes:
-        pure_code = code.split(".")[0]
-        market    = code.split(".")[1].lower() if "." in code else "sh"
-        try:
-            resp = requests.post("http://www.cninfo.com.cn/new/information/topSearch/query",
-                data={"keyWord": pure_code, "maxNum": 5}, headers=headers, timeout=10)
-            org_id, stock_name = None, pure_code
-            for item in resp.json().get("keyBoardList", []):
-                if item.get("code") == pure_code:
-                    org_id, stock_name = item.get("orgId"), item.get("zwjc", pure_code)
-                    break
-            if not org_id:
-                continue
-            ann_resp = requests.post("http://www.cninfo.com.cn/new/hisAnnouncement/query",
-                data={"stock": f"{pure_code},{org_id}", "tabName": "fulltext", "pageSize": 30,
-                      "pageNum": 1, "column": "szse" if market=="sz" else "sse",
-                      "category": "", "plate": market, "seDate": f"{start_date}~{end_date}",
-                      "searchkey": "", "isHLtitle": True},
-                headers=headers, timeout=15)
-            for ann in ann_resp.json().get("announcements", []):
-                aid = ann.get("announcementId", "")
-                announcements.append({
-                    "id":    aid, "code": code, "name": stock_name,
-                    "title": ann.get("announcementTitle", ""),
-                    "time":  ann.get("announcementTime", ""),
-                    "url":   f"http://www.cninfo.com.cn/new/announcement/detail?announcementId={aid}&orgId={org_id}",
-                })
-        except Exception as e:
-            st.warning(f"⚠️ {code} 巨潮获取失败：{e}")
-    return announcements
 
 # ─────────────────────────────────────────────
 # Session State 初始化
 # ─────────────────────────────────────────────
 for k, v in {
-    "watch_stocks":      [],
-    "announcements":     [],
-    "new_ids":           set(),
-    "last_check":        None,
-    "total_new":         0,
-    "check_days":        1,
-    "ann_type_filter":   "全部",
-    "push_log":          [],
-    "data_source":       "tushare",
-    "stocks_loaded":     False,   # 标记是否已从 GitHub 加载过
+    "watch_stocks":    [],
+    "announcements":   [],
+    "new_ids":         set(),
+    "last_check":      None,
+    "total_new":       0,
+    "check_days":      1,
+    "ann_type_filter": "全部",
+    "push_log":        [],
+    "stocks_loaded":   False,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# 首次加载：从 GitHub 读取持久化的股票列表
+# 首次加载：从 GitHub 读取持久化股票列表
 if not st.session_state.stocks_loaded:
     try:
         _gh_token = st.secrets.get("GITHUB_TOKEN", "")
@@ -383,17 +289,12 @@ if not st.session_state.stocks_loaded:
 # ─────────────────────────────────────────────
 # 检查公告
 # ─────────────────────────────────────────────
-def do_check(sendkey="", tushare_token=""):
-    codes = [s["code"] for s in st.session_state.watch_stocks]
-    if not codes:
+def do_check(sendkey=""):
+    if not st.session_state.watch_stocks:
         st.warning("请先添加要监控的股票")
         return 0
 
-    if st.session_state.data_source == "tushare":
-        anns = fetch_tushare(codes, tushare_token, days=st.session_state.check_days)
-    else:
-        anns = fetch_cninfo(codes, days=st.session_state.check_days)
-
+    anns  = fetch_all(st.session_state.watch_stocks, days=st.session_state.check_days)
     cache = load_cache()
     new_anns, new_ids = [], set()
     for ann in anns:
@@ -411,9 +312,10 @@ def do_check(sendkey="", tushare_token=""):
 
     if new_anns and sendkey:
         title = f"📋 {len(new_anns)} 条新公告｜{', '.join(set(a['name'] for a in new_anns))}"
-        ok    = send_wechat(sendkey, title, build_wechat_content(new_anns))
+        ok_count, fail_count = send_wechat(sendkey, title, build_wechat_content(new_anns))
+        total = ok_count + fail_count
         st.session_state.push_log.append(
-            f"[{datetime.now().strftime('%H:%M:%S')}] {'✅' if ok else '❌'} 微信推送 {len(new_anns)} 条")
+            f"[{datetime.now().strftime('%H:%M:%S')}] 微信推送 {len(new_anns)} 条 · {ok_count}/{total} 成功")
     return len(new_ids)
 
 # ═══════════════════════════════
@@ -423,28 +325,16 @@ with st.sidebar:
     st.markdown("## 📋 股票公告监控")
     st.markdown("---")
 
-    # ── 数据源 ──
-    st.markdown("### 📡 数据源")
-    src = st.radio("", ["Tushare（推荐）", "巨潮资讯（备用）"], label_visibility="collapsed")
-    st.session_state.data_source = "tushare" if "Tushare" in src else "cninfo"
-
-    default_ts_token = ""
+    # ── 读取 Secrets ──
     default_sendkey  = ""
     default_sendkey2 = ""
+    gh_token         = ""
     try:
-        default_ts_token = st.secrets.get("TUSHARE_TOKEN", "")
         default_sendkey  = st.secrets.get("SENDKEY", "")
         default_sendkey2 = st.secrets.get("SENDKEY2", "")
+        gh_token         = st.secrets.get("GITHUB_TOKEN", "")
     except Exception:
         pass
-
-    tushare_token = ""
-    if st.session_state.data_source == "tushare":
-        tushare_token = st.text_input("Tushare Token", type="password",
-            value=default_ts_token, placeholder="粘贴你的 Token")
-        st.markdown('<small style="color:#7d8590">👉 <a href="https://tushare.pro/register" target="_blank" style="color:#00d4ff">注册 Tushare</a> 免费获取Token（公告接口需积分≥120）</small>', unsafe_allow_html=True)
-
-    st.markdown("---")
 
     # ── 微信推送 ──
     st.markdown("### 📱 微信推送")
@@ -454,6 +344,7 @@ with st.sidebar:
     sendkey2 = st.text_input("微信2 SendKey（可选）", type="password",
         value=default_sendkey2, placeholder="第二个微信的Key，留空跳过")
     all_sendkeys = ",".join(k for k in [sendkey, sendkey2] if k.strip())
+
     if all_sendkeys:
         if st.button("🧪 测试推送", use_container_width=True):
             ok_count, fail_count = send_wechat(all_sendkeys, "✅ 股票监控测试", "推送成功！有新公告时会自动通知你 📋")
@@ -461,7 +352,7 @@ with st.sidebar:
             if ok_count == total:
                 st.success(f"✅ {ok_count} 个微信推送成功！")
             elif ok_count > 0:
-                st.warning(f"⚠️ {ok_count} 个成功，{fail_count} 个失败，检查失败的 SendKey")
+                st.warning(f"⚠️ {ok_count} 个成功，{fail_count} 个失败")
             else:
                 st.error("❌ 全部失败，检查 SendKey 是否正确")
 
@@ -469,17 +360,9 @@ with st.sidebar:
 
     # ── 批量输入股票 ──
     st.markdown("### ➕ 批量输入股票")
-    # 有 token 时预热股票字典缓存
-    if tushare_token and "stock_dict" not in st.session_state:
-        with st.spinner("首次加载股票列表..."):
-            d = get_stock_dict(tushare_token)
-        if d:
-            st.success(f"✅ 已加载 {len(d)} 只股票，支持中文名称搜索")
-
     st.markdown("""<div class="tip-box">
     支持以下所有格式（每行一个，也可逗号分隔）：<br>
     <code>生益科技</code> ← 直接输中文名 ✅<br>
-    <code>生益电子</code> ← 模糊匹配 ✅<br>
     <code>600036.SH 招商银行</code><br>
     <code>000858 五粮液</code><br>
     <code>600036,000858,300750</code><br>
@@ -487,13 +370,13 @@ with st.sidebar:
     </div>""", unsafe_allow_html=True)
 
     batch_input = st.text_area("", height=140,
-        placeholder="600036.SH 招商银行\n000858.SZ 五粮液\n300750,宁德时代\n601318",
+        placeholder="600036.SH 招商银行\n000858.SZ 五粮液\n300750\n生益科技",
         label_visibility="collapsed")
 
     if st.button("✅ 确认添加", use_container_width=True):
         if batch_input.strip():
             st.session_state["_unresolved"] = []
-            parsed = parse_stock_input(batch_input, token=tushare_token)
+            parsed = parse_stock_input(batch_input)
             added, skipped = 0, 0
             for s in parsed:
                 if not any(x["code"] == s["code"] for x in st.session_state.watch_stocks):
@@ -501,34 +384,25 @@ with st.sidebar:
                     added += 1
                 else:
                     skipped += 1
-            unresolved = st.session_state.get("_unresolved", [])
             if added:
-                # 保存到 GitHub
-                try:
-                    _gh_token = st.secrets.get("GITHUB_TOKEN", "")
-                except Exception:
-                    _gh_token = ""
-                if _gh_token:
-                    save_stocks_to_github(_gh_token, st.session_state.watch_stocks)
+                if gh_token:
+                    save_stocks_to_github(gh_token, st.session_state.watch_stocks)
                 msg = f"✅ 成功添加 {added} 只股票！"
                 if skipped: msg += f"（{skipped} 只已在列表中跳过）"
                 st.success(msg)
                 st.rerun()
-            elif skipped and not unresolved:
-                st.info(f"ℹ️ {skipped} 只股票已在监控列表中，无需重复添加")
+            elif skipped:
+                st.info(f"ℹ️ {skipped} 只股票已在监控列表中")
+            unresolved = st.session_state.get("_unresolved", [])
             if unresolved:
-                st.warning(f"⚠️ 以下名称未能识别，请改用股票代码：**{'、'.join(unresolved)}**")
+                st.warning(f"⚠️ 未能识别，请改用代码：**{'、'.join(unresolved)}**")
         else:
             st.warning("请先输入股票代码或名称")
 
     if st.button("🗑 清空全部股票", use_container_width=True):
         st.session_state.watch_stocks = []
-        try:
-            _gh_token = st.secrets.get("GITHUB_TOKEN", "")
-        except Exception:
-            _gh_token = ""
-        if _gh_token:
-            save_stocks_to_github(_gh_token, [])
+        if gh_token:
+            save_stocks_to_github(gh_token, [])
         st.rerun()
 
     # ── 当前监控列表 ──
@@ -538,16 +412,14 @@ with st.sidebar:
         for i, s in enumerate(st.session_state.watch_stocks):
             c1, c2 = st.columns([4, 1])
             with c1:
-                st.markdown(f'<span class="stock-tag"><span class="dot-green"></span>{s["name"]} <span style="color:#7d8590;font-size:11px">{s["code"]}</span></span>', unsafe_allow_html=True)
+                st.markdown(f'<span class="stock-tag"><span class="dot-green"></span>{s["name"]} '
+                            f'<span style="color:#7d8590;font-size:11px">{s["code"]}</span></span>',
+                            unsafe_allow_html=True)
             with c2:
                 if st.button("×", key=f"del_{i}"):
                     st.session_state.watch_stocks.pop(i)
-                    try:
-                        _gh_token = st.secrets.get("GITHUB_TOKEN", "")
-                    except Exception:
-                        _gh_token = ""
-                    if _gh_token:
-                        save_stocks_to_github(_gh_token, st.session_state.watch_stocks)
+                    if gh_token:
+                        save_stocks_to_github(gh_token, st.session_state.watch_stocks)
                     st.rerun()
 
     st.markdown("---")
@@ -557,25 +429,23 @@ with st.sidebar:
 # 主界面
 # ═══════════════════════════════
 st.markdown('<h1 style="color:#e6edf3;font-size:26px;font-weight:800;margin-bottom:4px;">📋 股票公告实时监控</h1>'
-            '<p style="color:#7d8590;font-size:13px;margin-top:0;">支持 Tushare · 巨潮资讯 · 微信实时推送</p>',
+            '<p style="color:#7d8590;font-size:13px;margin-top:0;">数据源：巨潮资讯 · 微信实时推送</p>',
             unsafe_allow_html=True)
 
-# 统计
 c1, c2, c3, c4 = st.columns(4)
-with c1: st.metric("监控股票",  f"{len(st.session_state.watch_stocks)} 只")
-with c2: st.metric("本次公告",  f"{len(st.session_state.announcements)} 条")
-with c3: st.metric("新增公告",  f"{len(st.session_state.new_ids)} 条",
+with c1: st.metric("监控股票", f"{len(st.session_state.watch_stocks)} 只")
+with c2: st.metric("本次公告", f"{len(st.session_state.announcements)} 条")
+with c3: st.metric("新增公告", f"{len(st.session_state.new_ids)} 条",
                    delta=f"+{len(st.session_state.new_ids)}" if st.session_state.new_ids else None)
-with c4: st.metric("最后检查",  st.session_state.last_check.strftime("%H:%M:%S") if st.session_state.last_check else "—")
+with c4: st.metric("最后检查", st.session_state.last_check.strftime("%H:%M:%S") if st.session_state.last_check else "—")
 
 st.markdown("---")
 
-# 操作栏
 b1, b2, b3, _ = st.columns([2, 2, 2, 4])
 with b1:
     if st.button("🔍 立即检查公告", use_container_width=True):
         with st.spinner("正在获取公告..."):
-            n = do_check(all_sendkeys, tushare_token)
+            n = do_check(all_sendkeys)
         if n > 0:
             st.success(f"🎉 发现 {n} 条新公告！{'已推送微信 📱' if all_sendkeys else ''}")
         else:
@@ -591,22 +461,19 @@ with b3:
         st.session_state.new_ids = set()
         st.rerun()
 
-# 自动刷新（1分钟 = 60秒）
+# 自动刷新
 if auto_refresh:
-    last = st.session_state.last_check
+    last    = st.session_state.last_check
     elapsed = (datetime.now() - last).seconds if last else 9999
     if elapsed >= 60:
         with st.spinner("🔄 自动检查中..."):
-            do_check(all_sendkeys, tushare_token)
+            do_check(all_sendkeys)
         st.rerun()
     else:
-        remaining = 60 - elapsed
-        st.info(f"⏳ 下次自动检查：{remaining} 秒后")
-        # 用 st.empty + time.sleep 实现倒计时刷新
-        time.sleep(min(remaining, 5))
+        st.info(f"⏳ 下次自动检查：{60 - elapsed} 秒后")
+        time.sleep(min(60 - elapsed, 5))
         st.rerun()
 
-# 推送日志
 if st.session_state.push_log:
     with st.expander("📬 推送日志"):
         for log in reversed(st.session_state.push_log[-10:]):
@@ -614,11 +481,9 @@ if st.session_state.push_log:
 
 st.markdown("---")
 
-# 公告类型筛选
 ANN_TYPES = ["全部", "定期报告", "业绩预告", "业绩快报", "重大事项", "股权变动", "增减持", "分红"]
 st.session_state.ann_type_filter = st.radio("", ANN_TYPES, horizontal=True, label_visibility="collapsed")
 
-# 公告列表
 anns = st.session_state.announcements
 if st.session_state.ann_type_filter != "全部":
     anns = [a for a in anns if st.session_state.ann_type_filter in a["title"]]
